@@ -1,3 +1,3 @@
-module StarScope
-  VERSION = "0.1.11"
+module Starscope
+  VERSION = '1.5.3'.freeze
 end

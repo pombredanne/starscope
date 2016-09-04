@@ -3,150 +3,238 @@
 lib = File.expand_path('../../lib', __FILE__)
 $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 
+require 'oj'
 require 'optparse'
 require 'readline'
 require 'starscope'
 
-options = {auto: true, progress: true}
-DEFAULT_DB=".starscope.db"
+DEFAULT_DB = '.starscope.db'.freeze
+CONFIG_FILE = File.join(Dir.home, '.starscope.json')
+GLOBAL_CONFIG = File.exist?(CONFIG_FILE) ? Oj.load_file(CONFIG_FILE, symbol_keys: true) : {}
+
+options = { read: true,
+            write: true,
+            update: true,
+            output: :normal,
+            export: [],
+            db: DEFAULT_DB
+}
 
 # Options Parsing
 OptionParser.new do |opts|
   opts.banner = <<END
 Usage: starscope [options] [PATHS]
 
-If you don't pass any of -n, -r, -w or PATHS, default behaviour is to recurse
-in the current directory and build or update the database `#{DEFAULT_DB}`.
+The default database is `#{DEFAULT_DB}` if you don't specify one with -f.
+The default behaviour is to read and update the database.
+If no database exists and no PATHS are specified, Starscope builds a new
+database by recursing in the current directory.
 
-Query scopes must be specified with `::`, for example -q calls,File::mtime.
+Scoped queries must use `::` as the scope separator, even for languages which
+have their own scope syntax.
+
+Website: https://github.com/eapache/starscope
+User Manual: https://github.com/eapache/starscope/blob/master/doc/USER_GUIDE.md
 END
 
   opts.separator "\nQueries"
-  opts.on("-d", "--dump [TABLE]", "Dumps the DB or specified table to stdout") do |tbl|
+  opts.on('-d', '--dump [TABLE]', 'Dumps the DB or specified table to stdout') do |tbl|
     options[:dump] = tbl || true
   end
-  opts.on("-l", "--line-mode", "Starts line-oriented interface") do
+  opts.on('-l', '--line-mode', 'Starts line-oriented interface') do
     options[:linemode] = true
   end
-  opts.on("-q", "--query TABLE,QUERY", "Looks up QUERY in TABLE") do |query|
+  opts.on('-q', '--query TABLE,QUERY', 'Looks up QUERY in TABLE') do |query|
     options[:query] = query
   end
-  opts.on("-s", "--summary", "Print a database summary to stdout") do
+  opts.on('-s', '--summary', 'Print a database summary to stdout') do
     options[:summary] = true
   end
 
   opts.separator "\nDatabase Management"
-  opts.on("-e", "--export FORMAT[,PATH]", "Export in FORMAT to PATH, (see EXPORTING)") do |export|
-    options[:export] = export
+  opts.on('-e', '--export FORMAT[,PATH]', 'Export in FORMAT to PATH, (see EXPORTING)') do |export|
+    options[:export] << export
   end
-  opts.on("-n", "--no-auto", "Don't automatically update/create the DB") do
-    options[:auto] = false
+  opts.on('-f', '--file FILE', "Use FILE instead of `#{DEFAULT_DB}`") do |path|
+    options[:db] = path
   end
-  opts.on("-r", "--read-db PATH", "Reads the DB from PATH instead of default") do |path|
-    options[:read] = path
+  opts.on('-x', '--exclude PATTERN', 'Skip files matching PATTERN') do |pattern|
+    options[:exclude] ||= []
+    options[:exclude] << pattern
   end
-  opts.on("-w", "--write-db PATH", "Writes the DB to PATH instead of default") do |path|
-    options[:write] = path
+  opts.on('--no-read', "Don't read the DB from a file") do
+    options[:read] = false
+  end
+  opts.on('--no-write', "Don't write the DB to a file") do
+    options[:write] = false
+  end
+  opts.on('--no-update', "Don't update the DB") do
+    options[:update] = false
+  end
+  opts.on('--force-update', 'Rebuild the DB by rescanning all files') do
+    options[:forceUpdate] = true
   end
 
   opts.separator "\nMisc"
-  opts.on("-v", "--version", "Print the version number") do
-    puts StarScope::VERSION
+  opts.on('-v', '--version', 'Print the version number') do
+    puts Starscope::VERSION
     exit
   end
-  opts.on("--no-progress", "Don't show progress-bar when updating DB") do
-    options[:progress] = false
+  opts.on('--verbose', 'Print extra status messages') do
+    if options[:output] == :quiet
+      $stderr.puts "Can't be both verbose and quiet"
+      exit(1)
+    end
+    options[:output] = :verbose
+  end
+  opts.on('--quiet', 'Print fewer messages') do
+    if options[:output] == :verbose
+      $stderr.puts "Can't be both verbose and quiet"
+      exit(1)
+    end
+    options[:output] = :quiet
   end
 
   opts.separator <<END
 \nEXPORTING
     At the moment two export formats are supported: 'ctags' and 'cscope'. If
-    you don't specify a path, the output is written to the files 'tags' (for
-    ctags) or 'cscope.out' (for cscope) in the current directory.
+    you don't specify a path, the output is written to the file '#{Starscope::Exportable::CTAGS_DEFAULT_PATH}' (for
+    ctags) or '#{Starscope::Exportable::CSCOPE_DEFAULT_PATH}' (for cscope) in the current directory.
 END
-
 end.parse!
 
 def print_summary(db)
-  db.summary.each do |name, count|
-    printf("%-8s %5d keys\n", name, count)
+  tables = db.tables
+  puts 'No tables' if tables.empty?
+  tables.sort.each do |table|
+    printf("%-9s %6d records\n", table, db.records(table).length)
   end
 end
 
-def run_query(db, table, value)
-  if not value
-    $stderr.puts "Invalid input - no query found."
+def format_record(db, rec)
+  "#{rec[:name].join ' '} -- #{rec[:file]}:#{rec[:line_no]} (#{db.line_for_record(rec).strip})"
+end
+
+def run_query(db, query, separator)
+  table = nil
+  match = []
+  filters = {}
+  query.split(separator).each do |tok|
+    unless table.nil?
+      match << tok
+      next
+    end
+
+    k, v = tok.split(':', 2)
+    if v.nil?
+      table = tok
+    else
+      filters[k.to_sym] = v
+    end
+  end
+  match = match.join(separator)
+
+  if match.empty?
+    $stderr.puts 'Invalid input - no query found.'
     return false
   end
-  key, results = db.query(table.to_sym, value)
-  if results
-    puts results.map {|val| StarScope::Datum.to_s(val)}
+  tables = (table == '*' ? db.tables : table.to_sym)
+  results = db.query(tables, match, filters)
+  if !results || results.empty?
+    puts 'No results found.'
   else
-    puts "No results found."
+    results.sort_by { |x| x[:name].join(' ') }.each do |rec|
+      puts format_record(db, rec)
+    end
   end
   return true
-rescue StarScope::DB::NoTableError
+rescue Starscope::DB::NoTableError
   $stderr.puts "Table '#{table}' doesn't exist."
   return false
+end
+
+def dump_table(db, table)
+  records = db.records(table).sort do |a, b|
+    a[:name][-1].to_s.downcase <=> b[:name][-1].to_s.downcase
+  end
+
+  puts "== Table: #{table} =="
+  puts 'No records' if records.empty?
+
+  records.each do |record|
+    puts format_record(db, record)
+  end
 end
 
 def dump(db, table)
-  if table
-    db.dump_table(table.to_sym)
+  case table
+  when nil
+    db.tables.each { |t| dump_table(db, t) }
+  when '_meta'
+    puts db.metadata
+  when '_files'
+    puts db.metadata(:files).keys
+  when /^_/
+    puts db.metadata(table[1..-1].to_sym)
   else
-    db.dump_all
+    dump_table(db, table.to_sym)
   end
+
   return true
-rescue StarScope::DB::NoTableError
+rescue Starscope::DB::NoTableError
   $stderr.puts "Table '#{table}' doesn't exist."
   return false
 end
 
-if options[:auto] and not options[:write]
-  options[:write] = DEFAULT_DB
-  options[:auto_write] = true
+def export(db, param)
+  format, path = param.split(',', 2)
+  db.export(format.to_sym, path)
+rescue Starscope::Exportable::UnknownExportFormatError
+  $stderr.puts "Unrecognized export format \"#{format}\""
 end
 
-if File.exists?(DEFAULT_DB) and not options[:read]
-  options[:read] = DEFAULT_DB
-end
+output = Starscope::Output.new(options[:output])
+db = Starscope::DB.new(output, GLOBAL_CONFIG)
 
-db = StarScope::DB.new(options[:progress])
+db_exists = File.exist?(options[:db])
 
-if options[:read]
-  db.load(options[:read])
-  if !ARGV.empty?
-    db.add_paths(ARGV)
-    new_data = true
-  end
-elsif ARGV.empty?
-  db.add_paths(['.'])
-  new_data = true
+if options[:read] && db_exists
+  # we consider it 'new data' if the db was upconverted from an old format
+  new_data = !db.load(options[:db])
 else
+  # no need to run an update if we didn't read any old data
+  options[:update] = false
+end
+
+if options[:exclude]
+  db.add_excludes(options[:exclude])
+  new_data = true
+end
+
+if options[:forceUpdate]
+  db.drop_all
+  options[:update] = true
+end
+
+if !ARGV.empty?
+  # paths specified, add them
   db.add_paths(ARGV)
   new_data = true
+elsif !(options[:read] && db_exists)
+  # no paths were specified and the database was not read or did not exist;
+  # default to building a new DB in the current directory
+  db.add_paths(['.'])
+  new_data = true
 end
 
-changed = db.update if options[:read] and options[:auto]
+updated = db.update if options[:update]
+new_data ||= updated
 
-db.save(options[:write]) if options[:write] and (new_data or changed or not options[:auto_write])
+db.save(options[:db]) if options[:write] && (new_data || !db_exists)
 
-if options[:export]
-  format, path = options[:export].split(',', 2)
-  case format
-  when 'ctags'
-    db.export_ctags(path || 'tags')
-  when 'cscope'
-    db.export_cscope(path || 'cscope.out')
-  else
-    puts "Unrecognized export format"
-  end
-end
+options[:export].each { |target| export(db, target) }
 
-if options[:query]
-  table, query = options[:query].split(',', 2)
-  run_query(db, table, query)
-end
+run_query(db, options[:query], ',') if options[:query]
 
 print_summary(db) if options[:summary]
 
@@ -163,6 +251,7 @@ def linemode_help
 Input can be a query of the form 'TABLE QUERY' or a special command starting
 with a '!'. Recognized special commands are:
   !dump [TABLE]
+  !export FORMAT[,PATH]
   !summary
   !update
 
@@ -174,29 +263,40 @@ end
 
 if options[:linemode]
   puts "Run your query as 'TABLE QUERY' or run '!help' for more information."
-  while input = Readline.readline("> ", true)
-    cmd, param = input.split(' ', 2)
-    if cmd[0] == '!'
-      case cmd[1..-1]
-      when "dump"
-        dump(db, param)
-      when "summary"
-        print_summary(db)
-      when "update"
-        changed = db.update
-        db.save(options[:write]) if options[:write] and changed
-      when "help"
-        puts linemode_help
-      when "version"
-        puts StarScope::VERSION
-      when "quit"
-        exit
+  begin
+    while (input = Readline.readline('> ', true))
+      next if input.empty?
+      cmd, param = input.split(' ', 2)
+      if cmd[0] == '!'
+        case cmd[1..-1]
+        when 'dump'
+          dump(db, param)
+        when 'export'
+          if param
+            export(db, param)
+          else
+            puts '!export requires an argument'
+          end
+        when 'summary'
+          print_summary(db)
+        when 'update'
+          changed = db.update
+          db.save(options[:db]) if options[:write] && changed
+        when 'help'
+          puts linemode_help
+        when 'version'
+          puts Starscope::VERSION
+        when 'quit'
+          exit
+        else
+          puts "Unknown command: '#{input}', try '!help'."
+        end
       else
-        puts "Unknown command: '#{input}', try '!help'."
+        success = run_query(db, input, ' ')
+        puts "Try '!help'." unless success
       end
-    else
-      success = run_query(db, cmd, param)
-      puts "Try '!help'." unless success
     end
+  rescue Interrupt
+    exit
   end
 end

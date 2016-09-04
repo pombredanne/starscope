@@ -1,7 +1,12 @@
 require 'minitest/autorun'
 require 'minitest/pride'
-require File.expand_path('../../lib/starscope.rb', __FILE__)
+require 'mocha/mini_test'
+require_relative '../lib/starscope'
 
-GOLANG_SAMPLE = 'test/files/sample_golang.go'
-RUBY_SAMPLE = 'test/files/sample_ruby.rb'
-EMPTY_FILE = 'test/files/empty'
+FIXTURES = 'test/fixtures'.freeze
+
+GOLANG_SAMPLE = "#{FIXTURES}/sample_golang.go".freeze
+JAVASCRIPT_EXAMPLE = "#{FIXTURES}/sample_javascript.js".freeze
+RUBY_SAMPLE = "#{FIXTURES}/sample_ruby.rb".freeze
+ERB_SAMPLE = "#{FIXTURES}/sample_erb.erb".freeze
+EMPTY_FILE = "#{FIXTURES}/empty".freeze

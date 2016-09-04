@@ -1,285 +1,340 @@
-require 'starscope/langs/go'
-require 'starscope/langs/ruby'
-require 'starscope/datum'
 require 'date'
 require 'oj'
+require 'set'
 require 'zlib'
-require 'ruby-progressbar'
 
-LANGS = [
-  StarScope::Lang::Go,
-  StarScope::Lang::Ruby
-]
+require 'starscope/exportable'
+require 'starscope/fragment_extractor'
+require 'starscope/queryable'
+require 'starscope/output'
 
-class StarScope::DB
+module Starscope
+  class DB
+    include Starscope::Exportable
+    include Starscope::Queryable
 
-  DB_FORMAT = 4
-  PBAR_FORMAT = '%t: %c/%C %E ||%b>%i||'
+    DB_FORMAT = 5
+    FRAGMENT = :'!fragment'
 
-  class NoTableError < StandardError; end
-  class UnknownDBFormatError < StandardError; end
+    # dynamically load all our language extractors
+    Dir.glob("#{File.dirname(__FILE__)}/langs/*.rb").each { |path| require path }
 
-  def initialize(progress)
-    @progress = progress
-    @paths = []
-    @files = {}
-    @tables = {}
-  end
+    langs = {}
+    extractors = []
+    Starscope::Lang.constants.each do |lang|
+      extractor = Starscope::Lang.const_get(lang)
+      extractors << extractor
+      langs[lang.to_sym] = extractor.const_get(:VERSION)
+    end
+    LANGS = langs.freeze
+    EXTRACTORS = extractors.freeze
 
-  def load(file)
-    File.open(file, 'r') do |file|
-      Zlib::GzipReader.wrap(file) do |file|
-        format = file.gets.to_i
-        if format == DB_FORMAT
-          @paths  = Oj.load(file.gets)
-          @files  = Oj.load(file.gets)
-          @tables = Oj.load(file.gets, :symbol_keys => true)
-        elsif format <= 2
-          # Old format (pre-json), so read the directories segment then rebuild
-          len = file.gets.to_i
-          add_paths(Marshal::load(file.read(len)))
-        elsif format < DB_FORMAT
-          # Old format, so read the directories segment then rebuild
-          add_paths(Oj.load(file.gets))
-        elsif format > DB_FORMAT
-          raise UnknownDBFormatError
+    class NoTableError < StandardError; end
+    class UnknownDBFormatError < StandardError; end
+
+    def initialize(output, config = {})
+      @output = output
+      @meta = { paths: [], files: {}, excludes: [],
+                langs: LANGS.dup, version: Starscope::VERSION }
+      @tables = {}
+      @config = config
+    end
+
+    # returns true iff the database was already in the most recent format
+    def load(filename)
+      @output.extra("Reading database from `#{filename}`... ")
+      current_fmt = open_db(filename)
+      fixup if current_fmt
+      current_fmt
+    end
+
+    def save(filename)
+      @output.extra("Writing database to `#{filename}`...")
+
+      # regardless of what the old version was, the new version is written by us
+      @meta[:version] = Starscope::VERSION
+
+      @meta[:langs].merge!(LANGS)
+
+      File.open(filename, 'w') do |file|
+        Zlib::GzipWriter.wrap(file) do |stream|
+          stream.puts DB_FORMAT
+          stream.puts Oj.dump @meta
+          stream.puts Oj.dump @tables
         end
       end
     end
-  end
 
-  def save(file)
-    File.open(file, 'w') do |file|
-      Zlib::GzipWriter.wrap(file) do |file|
-        file.puts DB_FORMAT
-        file.puts Oj.dump @paths
-        file.puts Oj.dump @files
-        file.puts Oj.dump @tables
+    def add_excludes(paths)
+      @output.extra("Excluding files in paths #{paths}...")
+      @meta[:paths] -= paths.map { |p| self.class.normalize_glob(p) }
+      paths = paths.map { |p| self.class.normalize_fnmatch(p) }
+      @meta[:excludes] += paths
+      @meta[:excludes].uniq!
+      @all_excludes = nil # clear cache
+
+      excluded = @meta[:files].keys.select { |name| matches_exclude?(name, paths) }
+      remove_files(excluded)
+    end
+
+    def add_paths(paths)
+      @output.extra("Adding files in paths #{paths}...")
+      @meta[:excludes] -= paths.map { |p| self.class.normalize_fnmatch(p) }
+      @all_excludes = nil # clear cache
+      paths = paths.map { |p| self.class.normalize_glob(p) }
+      @meta[:paths] += paths
+      @meta[:paths].uniq!
+      files = Dir.glob(paths).select { |f| File.file? f }
+      files.delete_if { |f| matches_exclude?(f) }
+      return if files.empty?
+      @output.new_pbar('Building', files.length)
+      add_files(files)
+      @output.finish_pbar
+    end
+
+    def update
+      changes = @meta[:files].keys.group_by { |name| file_changed(name) }
+      changes[:modified] ||= []
+      changes[:deleted] ||= []
+
+      new_files = (Dir.glob(@meta[:paths]).select { |f| File.file? f }) - @meta[:files].keys
+      new_files.delete_if { |f| matches_exclude?(f) }
+
+      if changes[:deleted].empty? && changes[:modified].empty? && new_files.empty?
+        @output.normal('No changes detected.')
+        return false
       end
-    end
-  end
 
-  def add_paths(paths)
-    paths -= @paths
-    return if paths.empty?
-    @paths += paths
-    files = paths.map {|p| self.class.files_from_path(p)}.flatten
-    return if files.empty?
-    if @progress
-      pbar = ProgressBar.create(:title => "Building", :total => files.length, :format => PBAR_FORMAT, :length => 80)
-    end
-    files.each do |f|
-      add_file(f)
-      pbar.increment if @progress
-    end
-  end
+      @output.new_pbar('Updating', changes[:modified].length + new_files.length)
+      remove_files(changes[:deleted])
+      update_files(changes[:modified])
+      add_files(new_files)
+      @output.finish_pbar
 
-  def update
-    new_files = (@paths.map {|p| self.class.files_from_path(p)}.flatten) - @files.keys
-    if @progress
-      pbar = ProgressBar.create(:title => "Updating", :total => new_files.length + @files.length, :format => PBAR_FORMAT, :length => 80)
-    end
-    changed = @files.keys.map do |f|
-      changed = update_file(f)
-      pbar.increment if @progress
-      changed
-    end
-    new_files.each do |f|
-      add_file(f)
-      pbar.increment if @progress
-    end
-    changed.any? || !new_files.empty?
-  end
-
-  def dump_table(table)
-    raise NoTableError if not @tables[table]
-    puts "== Table: #{table} =="
-    @tables[table].sort_by{|k,v| k.downcase}.each do |val, data|
-      puts "#{val}"
-      data.each do |datum|
-        print "\t"
-        puts StarScope::Datum.to_s(datum)
-      end
-    end
-  end
-
-  def dump_all
-    @tables.keys.each {|tbl| dump_table(tbl)}
-  end
-
-  def summary
-    ret = {}
-
-    @tables.each_key do |key|
-      ret[key] = @tables[key].keys.count
+      true
     end
 
-    ret
-  end
+    def line_for_record(rec)
+      return rec[:line] if rec[:line]
 
-  def query(table, value)
-    fqn = value.split("::")
-    raise NoTableError if not @tables[table]
-    key = fqn.last
-    results = @tables[table][key.to_sym] || []
-    if results.empty?
-      matcher = Regexp.new(key, Regexp::IGNORECASE)
-      @tables[table].each do |k,v|
-        if matcher.match(k)
-          results << v
-        end
-      end
-      results.flatten!
-    end
-    return results if results.empty?
-    results.sort! do |a,b|
-      StarScope::Datum.score_match(b, fqn) <=> StarScope::Datum.score_match(a, fqn)
-    end
-    best_score = StarScope::Datum.score_match(results[0], fqn)
-    results = results.select do |result|
-      best_score - StarScope::Datum.score_match(result, fqn) < 4
-    end
-    return fqn.last.to_sym, results
-  end
+      file = @meta[:files][rec[:file]]
 
-  def export_ctags(filename)
-    File.open(filename, 'w') do |file|
-      file.puts <<END
-!_TAG_FILE_FORMAT	2	//
-!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
-!_TAG_PROGRAM_AUTHOR	Evan Huus //
-!_TAG_PROGRAM_NAME	Starscope //
-!_TAG_PROGRAM_URL	https://github.com/eapache/starscope //
-!_TAG_PROGRAM_VERSION	#{StarScope::VERSION}	//
-END
-      defs = (@tables[:defs] || {}).sort
-      defs.each do |key, val|
-        val.each do |entry|
-          file.puts StarScope::Datum.ctag_line(entry)
+      return file[:lines][rec[:line_no] - 1] if file[:lines]
+    end
+
+    def tables
+      @tables.keys
+    end
+
+    def records(table)
+      raise NoTableError unless @tables[table]
+
+      @tables[table]
+    end
+
+    def metadata(key = nil)
+      return @meta.keys if key.nil?
+
+      raise NoTableError unless @meta[key]
+
+      @meta[key]
+    end
+
+    def drop_all
+      @meta[:files] = {}
+      @tables = {}
+    end
+
+    private
+
+    def open_db(filename)
+      File.open(filename, 'r') do |file|
+        begin
+          Zlib::GzipReader.wrap(file) do |stream|
+            parse_db(stream)
+          end
+        rescue Zlib::GzipFile::Error
+          file.rewind
+          parse_db(file)
         end
       end
     end
-  end
 
-  # ftp://ftp.eeng.dcu.ie/pub/ee454/cygwin/usr/share/doc/mlcscope-14.1.8/html/cscope.html
-  def export_cscope(filename)
-    buf = ""
-    files = []
-    db_by_line().each do |file, lines|
-      if not lines.empty?
-        buf << "\t@#{file}\n\n"
-        files << file
+    # returns true iff the database is in the most recent format
+    def parse_db(stream)
+      case stream.gets.to_i
+      when DB_FORMAT
+        @meta   = Oj.load(stream.gets)
+        @tables = Oj.load(stream.gets)
+        return true
+      when 3..4
+        # Old format, so read the directories segment then rebuild
+        add_paths(Oj.load(stream.gets))
+        return false
+      when 0..2
+        # Old format (pre-json), so read the directories segment then rebuild
+        len = stream.gets.to_i
+        add_paths(Marshal.load(stream.read(len)))
+        return false
+      else
+        raise UnknownDBFormatError
       end
-      lines.sort.each do |line_no, vals|
-        line = vals.first[:entry][:line].strip.gsub(/\s+/, ' ')
-        toks = {}
+    rescue Oj::ParseError
+      stream.rewind
+      raise unless stream.gets.to_i == DB_FORMAT
+      # try reading as formated json, which is much slower, but it is sometimes
+      # useful to be able to directly read your db
+      objects = []
+      Oj.load(stream) { |obj| objects << obj }
+      @meta, @tables = objects
+      return true
+    end
 
-        vals.each do |val|
-          index = line.index(val[:key].to_s)
-          while index
-            toks[index] = val
-            index = line.index(val[:key].to_s, index + 1)
+    def fixup
+      # misc things that were't worth bumping the format for, but which might not be written by old versions
+      @meta[:langs] ||= {}
+    end
+
+    def all_excludes
+      @all_excludes ||= @meta[:excludes] + (@config[:excludes] || []).map { |x| self.class.normalize_fnmatch(x) }
+    end
+
+    def matches_exclude?(file, patterns = all_excludes)
+      patterns.map { |p| File.fnmatch(p, file) }.any?
+    end
+
+    def add_files(files)
+      files.each do |file|
+        @output.extra("Adding `#{file}`")
+        parse_file(file)
+        @output.inc_pbar
+      end
+    end
+
+    def remove_files(files)
+      files.each do |file|
+        @output.extra("Removing `#{file}`")
+        @meta[:files].delete(file)
+      end
+      files = files.to_set
+      @tables.each do |_, tbl|
+        tbl.delete_if { |val| files.include?(val[:file]) }
+      end
+    end
+
+    def update_files(files)
+      remove_files(files)
+      add_files(files)
+    end
+
+    def parse_file(file)
+      @meta[:files][file] = { last_updated: File.mtime(file).to_i }
+
+      self.class.extractors.each do |extractor|
+        begin
+          next unless extractor.match_file file
+        rescue => e
+          @output.normal("#{extractor} raised \"#{e}\" while matching #{file}")
+          next
+        end
+
+        line_cache = File.readlines(file)
+        lines = Array.new(line_cache.length)
+        @meta[:files][file][:sublangs] = []
+        extract_file(extractor, file, line_cache, lines)
+
+        break
+      end
+    end
+
+    def extract_file(extractor, file, line_cache, lines)
+      fragment_cache = {}
+
+      extractor_metadata = extractor.extract(file, File.read(file)) do |tbl, name, args|
+        case tbl
+        when FRAGMENT
+          fragment_cache[name] ||= []
+          fragment_cache[name] << args
+        else
+          @tables[tbl] ||= []
+          @tables[tbl] << self.class.normalize_record(file, name, args)
+
+          if args[:line_no]
+            line_cache ||= File.readlines(file)
+            lines ||= Array.new(line_cache.length)
+            lines[args[:line_no] - 1] = line_cache[args[:line_no] - 1].chomp
           end
         end
+      end
 
-        next if toks.empty?
+      fragment_cache.each do |lang, frags|
+        extract_file(Starscope::FragmentExtractor.new(lang, frags), file, line_cache, lines)
+        @meta[:files][file][:sublangs] << lang
+      end
 
-        prev = 0
-        buf << line_no.to_s << " "
-        toks.sort().each do |offset, val|
-          buf << line.slice(prev...offset) << "\n"
-          buf << StarScope::Datum.cscope_mark(val[:tbl], val[:entry])
-          buf << val[:key].to_s << "\n"
-          prev = offset + val[:key].to_s.length
-        end
-        buf << line.slice(prev..-1) << "\n\n"
+      @meta[:files][file][:lang] = extractor.name.split('::').last.to_sym
+      @meta[:files][file][:lines] = lines
+
+      if extractor_metadata.is_a? Hash
+        @meta[:files][file] = extractor_metadata.merge!(@meta[:files][file])
+      end
+
+    rescue => e
+      @output.normal("#{extractor} raised \"#{e}\" while extracting #{file}")
+    end
+
+    def file_changed(name)
+      file_meta = @meta[:files][name]
+      if matches_exclude?(name) || !File.exist?(name) || !File.file?(name)
+        :deleted
+      elsif (file_meta[:last_updated] < File.mtime(name).to_i) ||
+            language_out_of_date(file_meta[:lang]) ||
+            (file_meta[:sublangs] || []).any? { |lang| language_out_of_date(lang) }
+        :modified
+      else
+        :unchanged
       end
     end
 
-    buf << "\t@\n"
-
-    header = "cscope 15 #{Dir.pwd} -c "
-    offset = "%010d\n" % (header.length + 11 + buf.length)
-
-    File.open(filename, 'w') do |file|
-      file.print(header)
-      file.print(offset)
-      file.print(buf)
-
-      file.print("#{@paths.length}\n")
-      @paths.each {|p| file.print("#{p}\n")}
-      file.print("0\n")
-      file.print("#{files.length}\n")
-      buf = ""
-      files.each {|f| buf << f + "\n"}
-      file.print("#{buf.length}\n#{buf}")
+    def language_out_of_date(lang)
+      return false unless lang
+      return true unless LANGS[lang]
+      (@meta[:langs][lang] || 0) < LANGS[lang]
     end
-  end
 
-  private
-
-  def self.files_from_path(path)
-    if File.file?(path)
-      [path]
-    elsif File.directory?(path)
-      Dir[File.join(path, "**", "*")].select {|p| File.file?(p)}
-    else
-      []
-    end
-  end
-
-  def db_by_line()
-    tmpdb = {}
-    @tables.each do |tbl, vals|
-      vals.each do |key, val|
-        val.each do |entry|
-          if entry[:line_no]
-            tmpdb[entry[:file]] ||= {}
-            tmpdb[entry[:file]][entry[:line_no]] ||= []
-            tmpdb[entry[:file]][entry[:line_no]] << {:tbl => tbl, :key => key, :entry => entry}
-          end
+    class << self
+      # File.fnmatch treats a "**" to match files and directories recursively
+      def normalize_fnmatch(path)
+        if path == '.'
+          '**'
+        elsif File.directory?(path)
+          File.join(path, '**')
+        else
+          path
         end
       end
-    end
-    return tmpdb
-  end
 
-  def add_file(file)
-    return if not File.file? file
+      # Dir.glob treats a "**" to only match directories recursively; you need
+      # "**/*" to match all files recursively
+      def normalize_glob(path)
+        if path == '.'
+          File.join('**', '*')
+        elsif File.directory?(path)
+          File.join(path, '**', '*')
+        else
+          path
+        end
+      end
 
-    @files[file] = File.mtime(file).to_s
+      def normalize_record(file, name, args)
+        args[:file] = file
+        args[:name] = Array(name).map(&:to_sym)
+        args
+      end
 
-    LANGS.each do |lang|
-      next if not lang.match_file file
-      lang.extract file do |tbl, key, args|
-        key = key.to_sym
-        @tables[tbl] ||= {}
-        @tables[tbl][key] ||= []
-        @tables[tbl][key] << StarScope::Datum.build(file, key, args)
+      def extractors # so we can stub it in tests
+        EXTRACTORS
       end
     end
   end
-
-  def remove_file(file)
-    @files.delete(file)
-    @tables.each do |name, tbl|
-      tbl.each do |key, val|
-        val.delete_if {|dat| dat[:file] == file}
-      end
-    end
-  end
-
-  def update_file(file)
-    if not File.exists?(file) or not File.file?(file)
-      remove_file(file)
-      true
-    elsif DateTime.parse(@files[file]).to_time.to_i < File.mtime(file).to_i
-      remove_file(file)
-      add_file(file)
-      true
-    else
-      false
-    end
-  end
-
 end
